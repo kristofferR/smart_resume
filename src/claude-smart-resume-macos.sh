@@ -145,6 +145,70 @@ find_latest_session() {
 }
 
 # ---------------------------------------------------------------------------
+# Extract the session UUID claude is being launched with, when it is knowable
+# from the arguments. cmux runs this wrapper AS claude (CMUX_CUSTOM_CLAUDE_PATH)
+# and injects "--session-id <uuid>", so the exact transcript id is sitting in
+# our argv — far more reliable than guessing the file by mtime. Also honors an
+# explicit "--resume <id>" / "--session-id=<id>" a user passes directly.
+#
+# Bare --resume/-r/--continue/-c (no id) yield nothing: the id is unknown until
+# claude picks one, so callers fall back to the mtime heuristic in those cases.
+# ---------------------------------------------------------------------------
+get_arg_session_id() {
+  local arg prev=''
+  for arg in "$@"; do
+    case "$prev" in
+      --session-id|--resume|-r)
+        # The id follows its flag; accept only a non-option token as the value.
+        if [[ -n "$arg" && "$arg" != -* ]]; then
+          printf '%s' "$arg"
+          return 0
+        fi
+        ;;
+    esac
+    case "$arg" in
+      --) break ;;                                          # end of options
+      --session-id=*) printf '%s' "${arg#--session-id=}"; return 0 ;;
+      --resume=*)     printf '%s' "${arg#--resume=}";     return 0 ;;
+    esac
+    prev="$arg"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Locate <session-id>.jsonl deterministically. A session id is a UUID, so there
+# is at most one match anywhere under PROJECTS_DIR — no cwd/mtime guessing. This
+# is what stops concurrent sessions (e.g. several cmux tabs sharing a directory)
+# from making the watcher latch onto the wrong transcript.
+#
+# find (not a shell glob) keeps a no-match silent under both bash and zsh —
+# zsh's default nomatch would otherwise error on an unmatched glob.
+# ---------------------------------------------------------------------------
+find_session_file_by_id() {
+  local sid="$1"
+  # Ids are UUIDs; reject anything with path/glob metacharacters so a crafted
+  # value can never turn the find -name pattern into a wildcard.
+  [[ "$sid" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+  find "$PROJECTS_DIR" -maxdepth 2 -name "${sid}.jsonl" -type f 2>/dev/null | head -1
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the transcript to track. Prefer the known session id (deterministic);
+# fall back to the cwd+mtime heuristic only when no id is knowable. When an id is
+# known but its file does not exist yet, return empty so callers keep waiting for
+# the right file instead of grabbing a newer unrelated one.
+# ---------------------------------------------------------------------------
+resolve_session_file() {
+  local tracked_sid="$1"
+  if [[ -n "$tracked_sid" ]]; then
+    find_session_file_by_id "$tracked_sid"
+  else
+    find_latest_session
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # sed -E instead of grep -oP (macOS grep lacks PCRE).
 # start_line parameter skips pre-existing lines — prevents re-matching the
 # old "resets …(" entry after a resume (same logic as Linux version).
@@ -335,13 +399,16 @@ show_countdown() {
 # required for auto-detection to function.
 # ---------------------------------------------------------------------------
 _rl_watcher() {
-  local claude_pid=$1
+  local claude_pid=$1 tracked_sid="${2:-}"
 
-  # Wait up to 30 s for the session file to be created by claude.
+  # Wait up to 30 s for the session file to be created by claude. When the
+  # session id is known, poll for that EXACT transcript — never fall back to
+  # the mtime heuristic, which races against other concurrent sessions (e.g.
+  # cmux tabs sharing a cwd) and would watch the wrong file.
   local session_file='' i=0
   while (( i++ < 30 )) && [[ -z "$session_file" ]]; do
     sleep 1
-    session_file=$(find_latest_session)
+    session_file=$(resolve_session_file "$tracked_sid")
   done
   [[ -z "$session_file" ]] && return
 
@@ -376,6 +443,7 @@ _rl_watcher() {
 # direct children for claude PID discovery.
 # ---------------------------------------------------------------------------
 _run_claude() {
+  local tracked_sid="$1"; shift   # known session id (may be empty); rest = claude args
   rm -f "${HOME}/.claude/.rl_warn"   # reset flag — each run starts clean
   local my_pid=$$
   local -a extra_args=()
@@ -404,7 +472,7 @@ _run_claude() {
       [[ -z "$claude_pid" ]] && sleep 0.05
     done
 
-    [[ -n "$claude_pid" ]] && _rl_watcher "$claude_pid"
+    [[ -n "$claude_pid" ]] && _rl_watcher "$claude_pid" "$tracked_sid"
   ) > /dev/null 2>/dev/null &
   local watcher_pid=$!
 
@@ -435,23 +503,32 @@ main() {
   local _bar='──────────────────────────────────────────────────────────────────'  # 66 chars
 
   while true; do
+    # Build the exact argv for this run so the tracked session id can be read
+    # straight from it: cmux injects --session-id on the first run, and every
+    # resume run carries the id explicitly.
+    local -a run_args=()
+    if [[ -z "$resume_id" ]]; then
+      run_args=("$@")
+    else
+      run_args=(--resume "$resume_id" "$resume_msg")
+    fi
+
+    local tracked_sid=''
+    tracked_sid=$(get_arg_session_id "${run_args[@]}")
+
     # Snapshot the session file's current line count before this run starts.
     # Passed to get_reset_info so only NEW lines are scanned — prevents the
     # post-resume loop where the old "resets …(" entry re-triggers a wait.
     local pre_run_lines=0 pre_run_file=''
-    pre_run_file=$(find_latest_session)
+    pre_run_file=$(resolve_session_file "$tracked_sid")
     if [[ -n "$pre_run_file" && -f "$pre_run_file" ]]; then
       pre_run_lines=$(wc -l < "$pre_run_file" 2>/dev/null | tr -d ' ' || echo 0)
     fi
 
-    if [[ -z "$resume_id" ]]; then
-      _run_claude "$@"
-    else
-      _run_claude --resume "$resume_id" "$resume_msg"
-    fi
+    _run_claude "$tracked_sid" "${run_args[@]}"
 
     local session_file=''
-    session_file=$(find_latest_session)
+    session_file=$(resolve_session_file "$tracked_sid")
     [[ -z "$session_file" || ! -f "$session_file" ]] && break
 
     # start_line: 1-based line to begin scanning from (skip pre-existing lines
